@@ -1,0 +1,12 @@
+[Unit]
+Description=ROG Ryuo I 240 OLED Daemon
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env python3 /home/blink/Desktop/ryuo_display/ryuo-daemon.py --rotate
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
