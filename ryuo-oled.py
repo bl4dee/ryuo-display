@@ -12,7 +12,7 @@ Commands:
   anim <stop|start>   Stop/start OLED animation
   monitor             Live sensor monitoring (Ctrl+C to stop)
   dump                Dump all non-zero registers
-  image <file>        Upload image/GIF to OLED display
+  image <file>        Upload image/GIF to OLED display (supports --filter, --brightness, etc.)
 
 Setup:
   sudo cp 99-ryuo.rules /etc/udev/rules.d/ && sudo udevadm control --reload
@@ -393,6 +393,11 @@ class RyuoDevice:
             except OSError:
                 pass  # cache write failure is non-fatal
 
+        return self.upload_gif_data(gif_data, slot=slot, progress_cb=progress_cb,
+                                     chunk_delay=chunk_delay)
+
+    def upload_gif_data(self, gif_data, slot=1, progress_cb=None, chunk_delay=0.02):
+        """Upload raw GIF bytes to the device."""
         size = len(gif_data)
         print(f"GIF data: {size} bytes")
         if progress_cb:
@@ -583,6 +588,86 @@ def cmd_monitor(dev):
         print("\nStopped.")
 
 
+OLED_W, OLED_H = 160, 128
+MIN_FRAME_MS = 33
+
+
+def _process_image(path, brightness=0, contrast=0, saturation=0, blur=0,
+                   sharpen=0, speed=1.0, filter_name=None, rotate=False):
+    """Apply edits/filters to image/GIF, return GIF bytes for upload."""
+    import io
+    from PIL import Image, ImageEnhance, ImageFilter, ImageOps, ImageChops
+
+    FILTERS = {
+        "noir":    lambda img: ImageEnhance.Contrast(ImageOps.grayscale(img.convert("RGB")).convert("RGB")).enhance(1.6),
+        "neon":    lambda img: ImageChops.lighter(img.convert("RGB"), ImageEnhance.Color(ImageEnhance.Brightness(img.convert("RGB").filter(ImageFilter.FIND_EDGES)).enhance(3.0)).enhance(2.5)),
+        "vhs":     lambda img: (lambda i: Image.merge("RGB", (ImageChops.offset(i.split()[0], 2, 0), i.split()[1], ImageChops.offset(i.split()[2], -1, 0))))(ImageEnhance.Color(img.convert("RGB")).enhance(0.6).filter(ImageFilter.GaussianBlur(0.8))),
+        "thermal": lambda img: ImageOps.colorize(img.convert("L"), black=(10, 0, 50), mid=(255, 30, 0), white=(255, 255, 50)),
+        "matrix":  lambda img: ImageEnhance.Contrast(ImageOps.colorize(img.convert("L"), black=(0, 5, 0), white=(0, 255, 60))).enhance(1.3),
+        "vapor":   lambda img: ImageOps.colorize(img.convert("L"), black=(20, 0, 40), mid=(255, 50, 200), white=(80, 255, 255)),
+        "pixel":   lambda img: img.convert("RGB").resize((img.width // 5, img.height // 5), Image.NEAREST).resize(img.size, Image.NEAREST),
+        "cinema":  lambda img: (lambda i: Image.merge("RGB", (i.split()[0].point(lambda x: min(255, int(x * 1.08))), i.split()[1], i.split()[2].point(lambda x: int(x * 0.92)))))(ImageEnhance.Color(ImageEnhance.Contrast(img.convert("RGB")).enhance(1.4)).enhance(0.85)),
+        "sketch":  lambda img: (lambda g, b: ImageChops.divide(g, ImageOps.invert(b), scale=1, offset=0).convert("RGB"))(ImageOps.grayscale(img.convert("RGB")), ImageOps.invert(ImageOps.grayscale(img.convert("RGB"))).filter(ImageFilter.GaussianBlur(8))),
+        "chrome":  lambda img: (lambda i: Image.merge("RGB", (i.split()[0], i.split()[1], i.split()[2].point(lambda x: min(255, int(x * 1.15))))))(ImageEnhance.Contrast(ImageEnhance.Color(img.convert("RGB")).enhance(0.2)).enhance(1.8)),
+        "glitch":  lambda img: Image.merge("RGB", (ImageChops.offset(img.convert("RGB").split()[0], 4, 1), img.convert("RGB").split()[1], ImageChops.offset(img.convert("RGB").split()[2], -3, -1))),
+        "glow":    lambda img: ImageChops.lighter(img.convert("RGB"), ImageEnhance.Brightness(img.convert("RGB").filter(ImageFilter.GaussianBlur(4))).enhance(1.6)),
+    }
+
+    def apply_edits(frame):
+        result = frame.convert("RGB")
+        if brightness != 0:
+            result = ImageEnhance.Brightness(result).enhance(1.0 + brightness * 0.12)
+        if contrast != 0:
+            result = ImageEnhance.Contrast(result).enhance(1.0 + contrast * 0.12)
+        if saturation != 0:
+            result = ImageEnhance.Color(result).enhance(1.0 + saturation * 0.15)
+        if blur > 0:
+            result = result.filter(ImageFilter.GaussianBlur(blur * 0.6))
+        if sharpen > 0:
+            for _ in range(sharpen):
+                result = result.filter(ImageFilter.SHARPEN)
+        if filter_name and filter_name in FILTERS:
+            result = FILTERS[filter_name](result)
+        return result
+
+    img = Image.open(path)
+    is_gif = hasattr(img, 'n_frames') and img.n_frames > 1
+
+    if is_gif:
+        frames, durations = [], []
+        for i in range(img.n_frames):
+            img.seek(i)
+            frame = img.copy().convert('RGBA')
+            frame.thumbnail((OLED_W, OLED_H), Image.LANCZOS)
+            canvas = Image.new('RGBA', (OLED_W, OLED_H), (0, 0, 0, 255))
+            canvas.paste(frame, ((OLED_W - frame.size[0]) // 2,
+                                 (OLED_H - frame.size[1]) // 2))
+            if rotate:
+                canvas = canvas.rotate(180)
+            canvas = apply_edits(canvas)
+            frames.append(canvas.convert("RGB"))
+            d = max(img.info.get('duration', 100) or 100, MIN_FRAME_MS)
+            durations.append(max(MIN_FRAME_MS, int(d / speed)))
+        p_frames = [f.quantize(colors=256, method=2) for f in frames]
+        buf = io.BytesIO()
+        p_frames[0].save(buf, format='GIF', save_all=True,
+                         append_images=p_frames[1:],
+                         duration=durations, loop=0, optimize=True)
+        return buf.getvalue()
+    else:
+        frame = img.convert('RGB')
+        frame.thumbnail((OLED_W, OLED_H), Image.LANCZOS)
+        canvas = Image.new('RGB', (OLED_W, OLED_H), (0, 0, 0))
+        canvas.paste(frame, ((OLED_W - frame.size[0]) // 2,
+                             (OLED_H - frame.size[1]) // 2))
+        if rotate:
+            canvas = canvas.rotate(180)
+        canvas = apply_edits(canvas)
+        buf = io.BytesIO()
+        canvas.quantize(colors=256, method=2).save(buf, format='GIF', optimize=True)
+        return buf.getvalue()
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="ROG Ryuo I 240 Controller",
@@ -594,6 +679,8 @@ def main():
   %(prog)s led 0 0 255 2       Set LED to blue (breathing)
   %(prog)s image photo.png     Upload image/GIF to OLED
   %(prog)s -r image cat.gif    Upload rotated 180° (for flipped mounts)
+  %(prog)s image cat.gif --filter noir --brightness 2
+  %(prog)s image cat.gif --filter neon --speed 0.5 --contrast 3
   %(prog)s color 255 0 0       Set OLED to solid red
   %(prog)s color 0 0 0         Clear OLED (black)
   %(prog)s anim stop           Pause OLED animation
@@ -618,6 +705,23 @@ Notes:
     parser.add_argument("-d", "--device", help="hidraw device path (auto-detected)")
     parser.add_argument("-r", "--rotate", action="store_true",
                         help="Rotate image 180 degrees before upload")
+    parser.add_argument("--brightness", type=int, default=0, metavar="N",
+                        help="Brightness adjustment (-5 to 5)")
+    parser.add_argument("--contrast", type=int, default=0, metavar="N",
+                        help="Contrast adjustment (-5 to 5)")
+    parser.add_argument("--saturation", type=int, default=0, metavar="N",
+                        help="Saturation adjustment (-5 to 5)")
+    parser.add_argument("--blur", type=int, default=0, metavar="N",
+                        help="Blur amount (0 to 5)")
+    parser.add_argument("--sharpen", type=int, default=0, metavar="N",
+                        help="Sharpen amount (0 to 5)")
+    parser.add_argument("--speed", type=float, default=1.0, metavar="X",
+                        help="GIF speed multiplier (e.g. 0.5, 2.0)")
+    parser.add_argument("--filter", dest="filter_name", metavar="NAME",
+                        choices=["noir", "neon", "vhs", "thermal", "matrix",
+                                 "vapor", "pixel", "cinema", "sketch", "chrome",
+                                 "glitch", "glow"],
+                        help="Apply a filter (noir neon vhs thermal matrix vapor pixel cinema sketch chrome glitch glow)")
 
     args = parser.parse_args()
     dev = RyuoDevice(args.device)
@@ -638,7 +742,20 @@ Notes:
             if not args.args:
                 print("Usage: image <path/to/image.png|gif>")
                 sys.exit(1)
-            dev.upload_image(args.args[0], rotate=args.rotate)
+            has_edits = (args.brightness != 0 or args.contrast != 0 or
+                         args.saturation != 0 or args.blur > 0 or
+                         args.sharpen > 0 or args.speed != 1.0 or
+                         args.filter_name)
+            if has_edits:
+                print(f"Processing {args.args[0]}...")
+                data = _process_image(
+                    args.args[0], args.brightness, args.contrast,
+                    args.saturation, args.blur, args.sharpen,
+                    args.speed, args.filter_name, args.rotate)
+                dev.upload_gif_data(data)
+                print("Uploaded with edits applied")
+            else:
+                dev.upload_image(args.args[0], rotate=args.rotate)
 
         elif args.command == "color":
             if not args.args or len(args.args) < 3:
@@ -652,13 +769,11 @@ Notes:
                 from PIL import Image
                 import io as _io
                 img = Image.new("RGB", (160, 128), (r, g, b))
+                if args.rotate:
+                    img = img.rotate(180)
                 buf = _io.BytesIO()
-                img.save(buf, format="GIF")
-                with tempfile.NamedTemporaryFile(suffix=".gif", delete=False) as f:
-                    f.write(buf.getvalue())
-                    tmp = f.name
-                dev.upload_image(tmp, rotate=args.rotate)
-                os.unlink(tmp)
+                img.quantize(colors=256, method=2).save(buf, format="GIF", optimize=True)
+                dev.upload_gif_data(buf.getvalue())
                 print(f"OLED set to RGB({r},{g},{b})")
             except ImportError:
                 print("Pillow required: nix-shell -p python3 python3Packages.pillow")
